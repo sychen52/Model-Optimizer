@@ -28,9 +28,11 @@ TinyDeepseekV3 (+ MLAAttention).
 
 from __future__ import annotations
 
+import copy
 import gc
 import importlib.util
 import inspect
+from contextlib import nullcontext
 from functools import partial, wraps
 from pathlib import Path
 from types import SimpleNamespace
@@ -46,7 +48,8 @@ from _test_utils.torch.transformers_models import (
     create_tiny_qwen3_moe_dir,
 )
 from vllm import LLM, ModelRegistry, SamplingParams
-from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.distributed import cleanup_dist_env_and_memory, graph_capture
+from vllm.forward_context import get_forward_context, set_forward_context
 from vllm.inputs import TokensPrompt
 from vllm.utils.import_utils import has_deep_gemm
 
@@ -67,6 +70,7 @@ from modelopt.torch.quantization.plugins.vllm import (
     disable_compilation,
 )
 from modelopt.torch.quantization.plugins.vllm_indexer import _QuantVLLMIndexerBase
+from modelopt.torch.utils.distributed import DistributedProcessGroup
 
 
 def _load_example_module(name: str):
@@ -796,6 +800,7 @@ def _boot_llm(model_dir, max_model_len=64, **extra):
     FlashInfer/TRTLLM kernels bypass them) and ``enable_expert_parallel=True``
     (keeps modelopt's MoE-specific calibration paths live).
     """
+    extra.setdefault("kv_cache_memory_bytes", 32 * 1024**2)
     return LLM(
         model=str(model_dir),
         enforce_eager=True,
@@ -1073,20 +1078,34 @@ _MOE_COMMUNICATION_FP8_CFG = {
 }
 
 
-def _quantize_moe_communication(self):
-    """Run on the worker: calibrate FP8 dispatch/combine quantizers, spying on prepare/finalize.
+def _moe_communication_quant_cfg(nvfp4):
+    quant_cfg = copy.deepcopy(_MOE_COMMUNICATION_FP8_CFG)
+    if nvfp4:
+        for entry in quant_cfg["quant_cfg"][1:]:
+            entry["cfg"] = {
+                "num_bits": (2, 1),
+                "block_sizes": {-1: 16, "type": "dynamic", "scale_bits": (4, 3)},
+            }
+    return quant_cfg
+
+
+def _quantize_moe_communication(self, *, nvfp4=False):
+    """Calibrate dispatch/combine quantizers and check the real prepare/finalize payloads.
 
     Returns, per routed-experts module, whether each quantizer calibrated to the amax of the
     tensors that the MoE kernel's prepare (dispatch) and finalize (combine) received, and whether
     those tensors are fake-quantized once calibration is done.
     """
     model = self.get_model()
+    quant_cfg = _moe_communication_quant_cfg(nvfp4)
     experts = {
         name: module
         for name, module in model.named_modules()
         if isinstance(module, vllm_plugin.RoutedExperts)
     }
     received = {name: {"dispatch": [], "combine": []} for name in experts}
+    emitted = {name: {"dispatch": [], "combine": []} for name in experts}
+    handles = []
 
     def spy(method, tensors, argument):
         signature = inspect.signature(method)
@@ -1107,16 +1126,27 @@ def _quantize_moe_communication(self):
         with disable_compilation(model):
             mtq.quantize(
                 model,
-                _MOE_COMMUNICATION_FP8_CFG,
+                quant_cfg,
                 forward_loop=lambda _: self.model_runner._dummy_run(4),
             )
         quantizers = {
             name: {"dispatch": module.dispatch_quantizer, "combine": module.combine_quantizer}
             for name, module in experts.items()
         }
+
+        def sync_stat(name, value, operation):
+            parallel = experts[name].parallel_state
+            return DistributedProcessGroup.get_dist_syncd_obj(
+                value,
+                [parallel.data_parallel_group, parallel.expert_model_parallel_group],
+                operation,
+            )
+
+        assert all(tensors for phases in received.values() for tensors in phases.values())
         calibrated = {
             name: [
-                quantizer.amax.item() == max(t.abs().amax().item() for t in received[name][phase])
+                quantizer.amax.item()
+                == sync_stat(name, max(t.abs().amax().item() for t in received[name][phase]), max)
                 for phase, quantizer in quantizers[name].items()
             ]
             for name in experts
@@ -1124,17 +1154,49 @@ def _quantize_moe_communication(self):
         for phases in received.values():
             for tensors in phases.values():
                 tensors.clear()
+
+        def record_quantizer_output(module, args, output, *, tensors):
+            tensors.append((args[0].clone(), output.clone()))
+
+        for name, phases in quantizers.items():
+            for phase, quantizer in phases.items():
+                handles.append(
+                    quantizer.register_forward_hook(
+                        partial(record_quantizer_output, tensors=emitted[name][phase])
+                    )
+                )
         self.model_runner._dummy_run(4)
-        # A fake-quantized tensor is its own fake quantization.
+        # A rank whose local experts were not selected can legitimately emit only zeros.
+        changed = {
+            name: {
+                phase: sync_stat(
+                    name,
+                    any(not torch.equal(before, after) for before, after in tensors),
+                    any,
+                )
+                for phase, tensors in phases.items()
+            }
+            for name, phases in emitted.items()
+        }
         return {
             name: calibrated[name]
             + [
-                all(torch.equal(quantizer(t), t) for t in received[name][phase])
-                for phase, quantizer in quantizers[name].items()
+                bool(received[name][phase])
+                and len(received[name][phase]) == len(emitted[name][phase])
+                and all(
+                    torch.equal(payload, output)
+                    for payload, (_, output) in zip(
+                        received[name][phase], emitted[name][phase], strict=True
+                    )
+                )
+                and changed[name][phase]
+                for phase in quantizers[name]
             ]
             for name in experts
         }
     finally:  # the fixture's engine is shared: restore the kernels' own prepare/finalize
+        for handle in handles:
+            handle.remove()
         for module in experts.values():
             prepare_finalize = module.quant_method.moe_kernel.prepare_finalize
             for attribute in ("prepare", "finalize", "finalize_async", "_combine_quantizer_owner"):
@@ -1142,11 +1204,156 @@ def _quantize_moe_communication(self):
 
 
 @_requires_routed_experts
-def test_tiny_qwen3_moe_communication_quantize(tiny_qwen3_moe_llm):
+@pytest.mark.parametrize("nvfp4", [False, True], ids=("fp8", "nvfp4"))
+@pytest.mark.timeout(300)
+def test_tiny_qwen3_moe_communication_quantize(tiny_qwen3_moe_llm, cuda_capability, nvfp4):
     """dispatch/combine quantizers act on exactly what the MoE kernel's prepare/finalize get."""
-    (results,) = tiny_qwen3_moe_llm.collective_rpc(_quantize_moe_communication)
+    if nvfp4 and cuda_capability[0] < 10:
+        pytest.skip("NVFP4 communication test requires Blackwell or newer")
+    (results,) = tiny_qwen3_moe_llm.collective_rpc(
+        partial(_quantize_moe_communication, nvfp4=nvfp4)
+    )
     assert len(results) >= 2, results
     assert all(all(checks) for checks in results.values()), results
+
+
+@torch.inference_mode()
+def _replay_moe_communication_graph(self, *, nvfp4=False):
+    """Capture a real routed-expert layer, then check device payloads after changed-input replay."""
+    model = self.get_model()
+    name, layer = next(
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, vllm_plugin.RoutedExperts)
+    )
+    assert layer.moe_config.sp_size == 1, "Graph regression uses unsliced token inputs"
+    prepare_finalize = layer.quant_method.moe_kernel.prepare_finalize
+    missing = object()
+    attributes = ("prepare", "finalize", "finalize_async", "_combine_quantizer_owner")
+    saved = {attribute: vars(prepare_finalize).get(attribute, missing) for attribute in attributes}
+    handles = []
+    payloads = {}
+
+    def observe(method, argument, phase):
+        index = list(inspect.signature(method).parameters).index(argument)
+
+        @wraps(method)
+        def record(*args, **kwargs):
+            value = args[index] if len(args) > index else kwargs[argument]
+            if phase not in payloads:  # Allocate during eager calibration, before capture.
+                payloads[phase] = torch.empty_like(value)
+            payloads[phase].copy_(value)
+            return method(*args, **kwargs)
+
+        return record
+
+    try:
+        # Put the native-finalize observer inside an existing ModelOpt hook, then restore it below.
+        owner = getattr(prepare_finalize, "_combine_quantizer_owner", None)
+        for attribute in ("finalize", "finalize_async"):
+            method = getattr(prepare_finalize, attribute, None)
+            if owner is not None and isinstance(method, partial):
+                if method.func == getattr(owner, "_quantize_combine", None):
+                    setattr(prepare_finalize, attribute, method.args[0])
+        vars(prepare_finalize).pop("_combine_quantizer_owner", None)
+        prepare_finalize.prepare = observe(prepare_finalize.prepare, "a1", "dispatch")
+        prepare_finalize.finalize = observe(
+            prepare_finalize.finalize, "fused_expert_output", "combine"
+        )
+
+        tokens = max(4, (layer.global_num_experts + layer.top_k - 1) // layer.top_k)
+        device = layer.w13_weight.device
+        values = torch.linspace(-1, 1, tokens * layer.hidden_size, device=device)
+        static_x = values.reshape(tokens, layer.hidden_size).to(layer.w13_weight.dtype)
+        topk_ids = (
+            torch.arange(tokens * layer.top_k, device=device, dtype=torch.int32)
+            .reshape(tokens, layer.top_k)
+            .remainder(layer.global_num_experts)
+        )
+        topk_weights = torch.full((tokens, layer.top_k), 1 / layer.top_k, device=device)
+        config = self.model_runner.vllm_config
+        counts = torch.full((config.parallel_config.data_parallel_size,), tokens, dtype=torch.int32)
+        quant_cfg = _moe_communication_quant_cfg(nvfp4)
+        for entry, phase in zip(quant_cfg["quant_cfg"][1:], ("dispatch", "combine"), strict=True):
+            entry["quantizer_name"] = f"{name}.{phase}_quantizer"
+
+        with set_forward_context(None, config, num_tokens=tokens, num_tokens_across_dp=counts):
+            metadata = get_forward_context().dp_metadata
+            with metadata.sp_local_sizes(layer.moe_config.sp_size) if metadata else nullcontext():
+
+                def run(x):
+                    return layer.forward_modular(x, topk_weights=topk_weights, topk_ids=topk_ids)
+
+                with disable_compilation(model):
+                    mtq.quantize(model, quant_cfg, forward_loop=lambda _: run(static_x))
+                for module in model.modules():
+                    if isinstance(module, TensorQuantizer):
+                        module.to(device)
+                for quantizer in (layer.dispatch_quantizer, layer.combine_quantizer):
+                    assert quantizer.is_enabled
+                    assert quantizer.amax is not None and quantizer.amax.device == device
+                    assert torch.isfinite(quantizer.amax).all() and (quantizer.amax > 0).all()
+                payloads["combine_before"] = torch.empty_like(payloads["combine"])
+
+                def record_combine_input(module, args):
+                    payloads["combine_before"].copy_(args[0])
+
+                handles.append(
+                    layer.combine_quantizer.register_forward_pre_hook(record_combine_input)
+                )
+                graph = torch.cuda.CUDAGraph()
+                with graph_capture(device) as capture:
+                    for _ in range(3):
+                        run(static_x)
+                    with torch.cuda.graph(graph, stream=capture.stream):
+                        static_output = run(static_x)
+                torch.cuda.current_stream().wait_stream(capture.stream)
+
+                for offset in (0.3, 1.1):
+                    new_x = torch.sin(values * 1.7 + offset).reshape_as(static_x).to(static_x.dtype)
+                    static_x.copy_(new_x)
+                    for payload in payloads.values():
+                        payload.fill_(float("nan"))
+                    static_output.fill_(float("nan"))
+                    graph.replay()
+                    replayed = {phase: payload.clone() for phase, payload in payloads.items()}
+                    replayed_output = static_output.clone()
+                    assert all(torch.isfinite(payload).all() for payload in replayed.values())
+                    assert torch.equal(static_x, new_x)
+                    assert torch.equal(replayed["dispatch"], layer.dispatch_quantizer(new_x))
+                    assert not torch.equal(replayed["dispatch"], new_x)
+                    assert torch.equal(
+                        replayed["combine"], layer.combine_quantizer(replayed["combine_before"])
+                    )
+                    assert not torch.equal(replayed["combine"], replayed["combine_before"])
+                    torch.testing.assert_close(replayed_output, run(new_x))
+        return {
+            "passed": True,
+            "replays": 2,
+            "experts_routed": layer.global_num_experts,
+            "prepare_finalize": type(prepare_finalize).__name__,
+        }
+    finally:
+        for handle in handles:
+            handle.remove()
+        for attribute, original in saved.items():
+            if original is missing:
+                vars(prepare_finalize).pop(attribute, None)
+            else:
+                setattr(prepare_finalize, attribute, original)
+
+
+@_requires_routed_experts
+@pytest.mark.parametrize("nvfp4", [False, True], ids=("fp8", "nvfp4"))
+@pytest.mark.timeout(300)
+def test_tiny_qwen3_moe_communication_graph_replay(tiny_qwen3_moe_llm, cuda_capability, nvfp4):
+    """Real Triton prepare/finalize payloads remain QDQ'd in a captured layer's replay."""
+    if nvfp4 and cuda_capability[0] < 10:
+        pytest.skip("NVFP4 communication test requires Blackwell or newer")
+    (result,) = tiny_qwen3_moe_llm.collective_rpc(
+        partial(_replay_moe_communication_graph, nvfp4=nvfp4)
+    )
+    assert result["passed"] and result["replays"] == 2, result
 
 
 def test_tiny_deepseek_mla_quantize(tiny_deepseek_llm):
